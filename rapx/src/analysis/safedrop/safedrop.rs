@@ -6,13 +6,14 @@ use std::collections::{HashMap, HashSet};
 
 use crate::analysis::core::alias::FnMap;
 use crate::analysis::safedrop::SafeDropGraph;
-use crate::rap_error;
+use crate::{rap_error, rap_info};
 
 pub const VISIT_LIMIT: usize = 1000;
 
 impl<'tcx> SafeDropGraph<'tcx> {
     // analyze the drop statement and update the liveness for nodes.
     pub fn drop_check(&mut self, bb_index: usize, tcx: TyCtxt<'tcx>) {
+        rap_info!("(drop_check) Drop check for block: {:?}", bb_index);
         let cur_block = self.blocks[bb_index].clone();
         for drop in cur_block.drops {
             match drop.kind {
@@ -28,7 +29,32 @@ impl<'tcx> SafeDropGraph<'tcx> {
                     let birth = self.scc_indices[bb_index];
                     let drop_local = self.projection(tcx, false, place.clone());
                     let info = drop.source_info.clone();
-                    self.dead_node(drop_local, birth, &info, false);
+                    rap_info!("(drop_check::Drop) Drop {:?}", drop_local);
+
+                    let mut alias_dead_nodes = HashSet::new();
+                    let mut field_dead_nodes = HashMap::new();
+                    self.dead_node(drop_local, birth, &info, false, &mut alias_dead_nodes, &mut field_dead_nodes);
+                    rap_info!("(drop_check::Drop) Dead nodes: {:?}", alias_dead_nodes);
+                    rap_info!("(drop_check::Drop) Field dead nodes: {:?}", field_dead_nodes);
+
+                    let drop_local_id = self.adg.add_drop_node(drop_local, drop.source_info.span);
+                    for to_drop in alias_dead_nodes {
+                        if to_drop == drop_local {
+                            continue;
+                        }
+                        rap_info!("(drop_check::Drop) Alias dead node: {:?}, cur: {:?}", to_drop, drop_local);
+                        let alias_id = self.adg.add_alias_node(drop_local, to_drop);
+                        let rule_id = self.adg.add_rule_node(
+                            &format!("DropAlias {:?} -> {:?}", drop_local, to_drop),
+                            1.0,
+                        );
+                        let to_drop_id = self.adg.add_drop_node(to_drop, drop.source_info.span);
+                        
+                        self.adg.add_edge(drop_local_id, rule_id);
+                        self.adg.add_edge(alias_id, rule_id);
+                        self.adg.add_edge(rule_id, to_drop_id);
+                    }
+
                 }
                 TerminatorKind::Call {
                     func: _, ref args, ..
@@ -45,7 +71,32 @@ impl<'tcx> SafeDropGraph<'tcx> {
                         };
                         let drop_local = self.projection(tcx, false, place.clone());
                         let info = drop.source_info.clone();
-                        self.dead_node(drop_local, birth, &info, false);
+                        rap_info!("(drop_check::Call) Drop {:?}", drop_local);
+
+                        let mut alias_dead_nodes = HashSet::new();
+                        let mut field_dead_nodes = HashMap::new();
+                        self.dead_node(drop_local, birth, &info, false, &mut alias_dead_nodes, &mut field_dead_nodes);
+
+                        rap_info!("(drop_check::Call) Dead nodes: {:?}", alias_dead_nodes);
+                        rap_info!("(drop_check::Call) Field dead nodes: {:?}", field_dead_nodes);
+
+                        let drop_local_id = self.adg.add_drop_node(drop_local, drop.source_info.span);
+                        for to_drop in alias_dead_nodes {
+                            if to_drop == drop_local {
+                                continue;
+                            }
+                            rap_info!("(drop_check::Call) Alias dead node: {:?}, cur: {:?}", to_drop, drop_local);
+                            let alias_id = self.adg.add_alias_node(drop_local, to_drop);
+                            let rule_id = self.adg.add_rule_node(
+                                &format!("DropAlias {:?} -> {:?}", drop_local, to_drop),
+                                1.0,
+                            );
+                            let to_drop_id = self.adg.add_drop_node(to_drop, drop.source_info.span);                            
+
+                            self.adg.add_edge(drop_local_id, rule_id);
+                            self.adg.add_edge(alias_id, rule_id);
+                            self.adg.add_edge(rule_id, to_drop_id);
+                        }
                     }
                 }
                 _ => {}

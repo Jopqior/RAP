@@ -1,7 +1,9 @@
+use super::adg::AlarmDerivationGraph;
 use super::bug_records::*;
 use super::types::*;
 use crate::analysis::core::heap_item::AdtOwner;
 use crate::analysis::utils::intrinsic_id::*;
+use crate::rap_info;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_middle::mir::{
     BasicBlock, Body, Const, Operand, Place, Rvalue, StatementKind, Terminator, TerminatorKind,
@@ -184,6 +186,8 @@ pub struct SafeDropGraph<'tcx> {
     >,
     pub disc_map: FxHashMap<usize, usize>,
     pub terms: Vec<TerminatorKind<'tcx>>,
+
+    pub adg: AlarmDerivationGraph,
 }
 
 impl<'tcx> SafeDropGraph<'tcx> {
@@ -355,6 +359,7 @@ impl<'tcx> SafeDropGraph<'tcx> {
                 }
             }
 
+            rap_info!("Block {}: {:?}", i, terminator);
             terms.push(terminator.kind.clone());
             // handle terminator statements
             match terminator.kind {
@@ -495,6 +500,9 @@ impl<'tcx> SafeDropGraph<'tcx> {
             child_scc: FxHashMap::default(),
             disc_map,
             terms,
+
+            // used for alarm derivation graph
+            adg: AlarmDerivationGraph::new(),
         }
     }
 

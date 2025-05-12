@@ -1,3 +1,4 @@
+pub mod adg;
 pub mod alias;
 pub mod bug_records;
 pub mod check_bugs;
@@ -14,6 +15,7 @@ use crate::analysis::core::alias::mop::MopAlias;
 use crate::analysis::core::alias::FnMap;
 use crate::analysis::core::heap_item::{AdtOwner, TypeAnalysis};
 use crate::analysis::rcanary::rCanary;
+use crate::rap_debug;
 use graph::SafeDropGraph;
 use safedrop::*;
 
@@ -28,6 +30,8 @@ impl<'tcx> SafeDrop<'tcx> {
     pub fn start(&self) {
         let mut mop = MopAlias::new(self.tcx);
         let fn_map = mop.start();
+
+        rap_debug!("{:?}", fn_map);
 
         let rcx_boxed = Box::new(rCanary::new(self.tcx));
         let rcx = Box::leak(rcx_boxed);
@@ -59,6 +63,13 @@ pub fn query_safedrop(tcx: TyCtxt, fn_map: &FnMap, def_id: DefId, adt_owner: Adt
         safedrop_graph.check(0, tcx, fn_map);
         if safedrop_graph.visit_times <= VISIT_LIMIT {
             safedrop_graph.report_bugs();
+
+            safedrop_graph.adg.remove_unreachable_nodes_from_alarm();
+            if safedrop_graph.adg.has_alarm() {
+                safedrop_graph.adg.calculate_alarm_confidences();
+                // println!("ADG: {:?}", safedrop_graph.adg);
+                safedrop_graph.adg.handle_user_feedback(None, None);
+            }
         } else {
             println!("Over visited: {:?}", def_id);
         }

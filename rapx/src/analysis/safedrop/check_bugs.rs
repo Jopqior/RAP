@@ -1,4 +1,8 @@
+use std::collections::{HashMap, HashSet};
+
+use super::adg::AlarmKind;
 use super::graph::*;
+use crate::rap_info;
 use crate::utils::source::*;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_middle::mir::SourceInfo;
@@ -28,7 +32,13 @@ impl<'tcx> SafeDropGraph<'tcx> {
         self.bug_records.dp_bug_output(fn_name, self.span);
     }
 
-    pub fn uaf_check(&mut self, aliaset_idx: usize, span: Span, local: usize, is_func_call: bool) {
+    pub fn uaf_check(
+        &mut self,
+        aliaset_idx: usize,
+        span: Span,
+        local: usize,
+        is_func_call: bool,
+    ) -> (bool, usize) {
         let mut record = FxHashSet::default();
         if self.values[aliaset_idx].may_drop
             && (!self.values[aliaset_idx].is_ptr()
@@ -38,7 +48,20 @@ impl<'tcx> SafeDropGraph<'tcx> {
             && !self.bug_records.uaf_bugs.contains(&span)
         {
             self.bug_records.uaf_bugs.insert(span.clone());
+
+            rap_info!(
+                "(uaf_check) aliaset_idx: {:?}, its birth: {:?}, record: {:?}",
+                aliaset_idx,
+                self.values[aliaset_idx].birth,
+                record
+            );
+            if let Some(dead_node) = record.iter().find(|&&i| !self.values[i].is_alive()) {
+                return (true, *dead_node);
+            }
+
+            return (true, aliaset_idx);
         }
+        (false, 0)
     }
 
     pub fn exist_dead(
@@ -50,13 +73,13 @@ impl<'tcx> SafeDropGraph<'tcx> {
         if node >= self.values.len() {
             return false;
         }
+        record.insert(node);
         //if is a dangling pointer check, only check the pointer type varible.
         if self.values[node].is_alive() == false
             && (dangling && self.values[node].is_ptr() || !dangling)
         {
             return true;
         }
-        record.insert(node);
         if self.union_has_alias(node) {
             // for i in self.values[node].alias.clone().into_iter() {
             //     if i != node && record.contains(&i) == false && self.exist_dead(i, record, dangling)
@@ -92,6 +115,15 @@ impl<'tcx> SafeDropGraph<'tcx> {
             && self.bug_records.df_bugs.contains_key(&root) == false
         {
             self.bug_records.df_bugs.insert(root, span.clone());
+
+            if let Some(drop_before_id) = self.adg.get_drop_node(drop) {
+                let drop_cur_id = self.adg.add_drop_node(drop, span);
+                let rule_id = self.adg.add_rule_node("DF", 1.0);
+                let alarm_id = self.adg.add_alarm_node(AlarmKind::DF, span);
+                self.adg.add_edge(drop_before_id, rule_id);
+                self.adg.add_edge(drop_cur_id, rule_id);
+                self.adg.add_edge(rule_id, alarm_id);
+            }
         }
         return self.values[drop].is_alive() == false;
     }
@@ -119,7 +151,15 @@ impl<'tcx> SafeDropGraph<'tcx> {
         }
     }
 
-    pub fn dead_node(&mut self, drop: usize, birth: usize, info: &SourceInfo, alias: bool) {
+    pub fn dead_node(
+        &mut self,
+        drop: usize,
+        birth: usize,
+        info: &SourceInfo,
+        alias: bool,
+        alias_dead_nodes: &mut HashSet<usize>,
+        field_dead_nodes: &mut HashMap<usize, Vec<(usize, usize)>>,
+    ) {
         //Rc drop
         if self.values[drop].is_corner_case() {
             return;
@@ -145,7 +185,9 @@ impl<'tcx> SafeDropGraph<'tcx> {
                 if !self.union_is_same(drop, i) || i == drop || self.values[i].is_ref() {
                     continue;
                 }
-                self.dead_node(i, birth, info, true);
+
+                alias_dead_nodes.insert(i);
+                self.dead_node(i, birth, info, true, alias_dead_nodes, field_dead_nodes);
             }
         }
         //drop the fields of the root node.
@@ -155,7 +197,11 @@ impl<'tcx> SafeDropGraph<'tcx> {
                 if self.values[drop].is_tuple() == true && self.values[i.1].need_drop == false {
                     continue;
                 }
-                self.dead_node(i.1, birth, info, false);
+                field_dead_nodes
+                    .entry(drop)
+                    .or_insert(vec![])
+                    .push(i.clone());
+                self.dead_node(i.1, birth, info, false, alias_dead_nodes, field_dead_nodes);
             }
         }
         //SCC.

@@ -1,15 +1,20 @@
+use std::collections::HashSet;
+
 use rustc_middle::mir::{Operand, Place, ProjectionElem, TerminatorKind};
 use rustc_middle::ty;
 use rustc_middle::ty::TyCtxt;
+use rustc_span::Span;
 
+use super::adg::AlarmKind;
 use super::graph::*;
 use super::types::*;
 use crate::analysis::core::alias::{FnMap, RetAlias};
-use crate::rap_error;
+use crate::{rap_error, rap_info};
 
 impl<'tcx> SafeDropGraph<'tcx> {
     /* alias analysis for a single block */
     pub fn alias_bb(&mut self, bb_index: usize, tcx: TyCtxt<'tcx>) {
+        rap_info!("(alias_bb) Found block {:?}", bb_index);
         for stmt in self.blocks[bb_index].const_value.clone() {
             self.constant.insert(stmt.0, stmt.1);
         }
@@ -27,15 +32,67 @@ impl<'tcx> SafeDropGraph<'tcx> {
                 }
                 _ => {} // Copy or Move
             }
-            self.uaf_check(
+
+            rap_info!(
+                "(alias_bb) Found assign: {:?} = {:?}, lv_aliaset_idx: {:?}, rv_aliaset_idx: {:?}",
+                assign.lv,
+                assign.rv,
+                lv_aliaset_idx,
+                rv_aliaset_idx
+            );
+            let exist_bug = self.uaf_check(
                 rv_aliaset_idx,
                 assign.span,
                 assign.rv.local.as_usize(),
                 false,
             );
+
+            // add adg node
+            if exist_bug.0 {
+                rap_info!("(alias_bb) Found UAF {:?}", assign.span);
+
+                // add drop node
+                let drop_id = self.adg.get_drop_node(exist_bug.1).unwrap();
+                rap_info!(
+                    "(alias_bb) Drop {:?} at {:?}",
+                    exist_bug.1,
+                    self.adg.get_node(drop_id).unwrap().kind
+                );
+
+                // add use node
+                rap_info!("(alias_bb) Use {:?}", rv_aliaset_idx);
+                let use_id = self.adg.add_use_node(rv_aliaset_idx, assign.span);
+
+                // add rule node
+                let rule_id = self.adg.add_rule_node("UAF", 0.999);
+
+                // add alarm node for use-after-free
+                let alarm_id = self.adg.add_alarm_node(AlarmKind::UAF, assign.span);
+
+                if exist_bug.1 == rv_aliaset_idx {
+                    self.adg.add_edge(drop_id, rule_id);
+                    self.adg.add_edge(use_id, rule_id);
+                    self.adg.add_edge(rule_id, alarm_id);
+                } else {
+                    let alias_id = self.adg.add_alias_node(rv_aliaset_idx, exist_bug.1);
+                    let drop_rule_id = self.adg.add_rule_node(
+                        &format!("DropAlias {:?} -> {:?}", exist_bug.1, rv_aliaset_idx),
+                        1.0,
+                    );
+                    let to_drop_id = self.adg.add_drop_node(rv_aliaset_idx, assign.span);
+                    self.adg.add_edge(drop_id, drop_rule_id);
+                    self.adg.add_edge(alias_id, drop_rule_id);
+                    self.adg.add_edge(drop_rule_id, to_drop_id);
+
+                    self.adg.add_edge(to_drop_id, rule_id);
+                    self.adg.add_edge(use_id, rule_id);
+                    self.adg.add_edge(rule_id, alarm_id);
+                }
+            }
+
             self.fill_birth(lv_aliaset_idx, self.scc_indices[bb_index] as isize);
             if self.values[lv_aliaset_idx].local != self.values[rv_aliaset_idx].local {
-                self.merge_alias(lv_aliaset_idx, rv_aliaset_idx);
+                self.handle_merge_alias(lv_aliaset_idx, rv_aliaset_idx, true, assign.span);
             }
         }
     }
@@ -54,6 +111,13 @@ impl<'tcx> SafeDropGraph<'tcx> {
                 fn_span: _,
             } = call.kind
             {
+                rap_info!(
+                    "(alias_bbcall) Found call: {:?} = {:?} {:?}",
+                    destination,
+                    func,
+                    args
+                );
+
                 if let Operand::Constant(ref constant) = func {
                     let lv = self.projection(tcx, false, destination.clone());
                     self.values[lv].birth = self.scc_indices[bb_index] as isize;
@@ -67,7 +131,58 @@ impl<'tcx> SafeDropGraph<'tcx> {
                         match arg.node {
                             Operand::Copy(ref p) => {
                                 let rv = self.projection(tcx, true, p.clone());
-                                self.uaf_check(rv, call.source_info.span, p.local.as_usize(), true);
+                                let exist_bug = self.uaf_check(
+                                    rv,
+                                    call.source_info.span,
+                                    p.local.as_usize(),
+                                    true,
+                                );
+
+                                if exist_bug.0 {
+                                    rap_info!("(alias_bbcall) Found UAF for copy arg");
+
+                                    // add alarm node for use-after-free
+                                    let alarm_id = self
+                                        .adg
+                                        .add_alarm_node(AlarmKind::UAF, call.source_info.span);
+
+                                    // add drop node
+                                    let drop_id = self.adg.get_drop_node(exist_bug.1).unwrap();
+                                    rap_info!(
+                                        "(alias_bbcall) Drop {:?} at {:?}",
+                                        exist_bug.1,
+                                        self.adg.get_node(drop_id).unwrap().kind
+                                    );
+
+                                    // add use node
+                                    rap_info!("(alias_bbcall) Use {:?}", rv);
+                                    let use_id = self.adg.add_use_node(rv, call.source_info.span);
+
+                                    // add rule node
+                                    let rule_id = self.adg.add_rule_node("UAF", 0.9);
+
+                                    if exist_bug.1 == rv {
+                                        self.adg.add_edge(drop_id, rule_id);
+                                        self.adg.add_edge(use_id, rule_id);
+                                        self.adg.add_edge(rule_id, alarm_id);
+                                    } else {
+                                        let alias_id = self.adg.add_alias_node(rv, exist_bug.1);
+                                        let drop_rule_id = self.adg.add_rule_node(
+                                            &format!("DropAlias {:?} -> {:?}", exist_bug.1, rv),
+                                            1.0,
+                                        );
+                                        let to_drop_id =
+                                            self.adg.add_drop_node(rv, call.source_info.span);
+                                        self.adg.add_edge(drop_id, drop_rule_id);
+                                        self.adg.add_edge(alias_id, drop_rule_id);
+                                        self.adg.add_edge(drop_rule_id, to_drop_id);
+
+                                        self.adg.add_edge(to_drop_id, rule_id);
+                                        self.adg.add_edge(use_id, rule_id);
+                                        self.adg.add_edge(rule_id, alarm_id);
+                                    }
+                                }
+
                                 merge_vec.push(rv);
                                 if self.values[rv].may_drop {
                                     may_drop_flag += 1;
@@ -75,7 +190,58 @@ impl<'tcx> SafeDropGraph<'tcx> {
                             }
                             Operand::Move(ref p) => {
                                 let rv = self.projection(tcx, true, p.clone());
-                                self.uaf_check(rv, call.source_info.span, p.local.as_usize(), true);
+                                let exist_bug = self.uaf_check(
+                                    rv,
+                                    call.source_info.span,
+                                    p.local.as_usize(),
+                                    true,
+                                );
+
+                                if exist_bug.0 {
+                                    rap_info!("(alias_bbcall) Found UAF for move arg");
+
+                                    // add drop node
+                                    let drop_id = self.adg.get_drop_node(exist_bug.1).unwrap();
+                                    rap_info!(
+                                        "(alias_bbcall) Drop {:?} at {:?}",
+                                        exist_bug.1,
+                                        self.adg.get_node(drop_id).unwrap().kind
+                                    );
+
+                                    // add use node
+                                    rap_info!("(alias_bbcall) Use {:?}", rv);
+                                    let use_id = self.adg.add_use_node(rv, call.source_info.span);
+
+                                    // add rule node
+                                    let rule_id = self.adg.add_rule_node("UAF", 0.9);
+
+                                    // add alarm node for use-after-free
+                                    let alarm_id = self
+                                        .adg
+                                        .add_alarm_node(AlarmKind::UAF, call.source_info.span);
+
+                                    if exist_bug.1 == rv {
+                                        self.adg.add_edge(drop_id, rule_id);
+                                        self.adg.add_edge(use_id, rule_id);
+                                        self.adg.add_edge(rule_id, alarm_id);
+                                    } else {
+                                        let alias_id = self.adg.add_alias_node(rv, exist_bug.1);
+                                        let drop_rule_id = self.adg.add_rule_node(
+                                            &format!("DropAlias {:?} -> {:?}", exist_bug.1, rv),
+                                            1.0,
+                                        );
+                                        let to_drop_id =
+                                            self.adg.add_drop_node(rv, call.source_info.span);
+                                        self.adg.add_edge(drop_id, drop_rule_id);
+                                        self.adg.add_edge(alias_id, drop_rule_id);
+                                        self.adg.add_edge(drop_rule_id, to_drop_id);
+
+                                        self.adg.add_edge(to_drop_id, rule_id);
+                                        self.adg.add_edge(use_id, rule_id);
+                                        self.adg.add_edge(rule_id, alarm_id);
+                                    }
+                                }
+
                                 merge_vec.push(rv);
                                 if self.values[rv].may_drop {
                                     may_drop_flag += 1;
@@ -95,7 +261,7 @@ impl<'tcx> SafeDropGraph<'tcx> {
                                         if !assign.valuable() {
                                             continue;
                                         }
-                                        self.merge(assign, &merge_vec);
+                                        self.merge(assign, &merge_vec, call.source_info.span);
                                     }
                                 }
                             } else {
@@ -184,6 +350,81 @@ impl<'tcx> SafeDropGraph<'tcx> {
         return proj_id;
     }
 
+    fn handle_merge_alias(
+        &mut self,
+        lv_aliaset_idx: usize,
+        rv_aliaset_idx: usize,
+        assign_or_call: bool,
+        span: Span,
+    ) {
+        let mut left_set = HashSet::new();
+        let mut right_set = HashSet::new();
+        let in_same_set = self.union_is_same(lv_aliaset_idx, rv_aliaset_idx);
+        if !in_same_set {
+            for i in 0..self.values.len() {
+                if i != lv_aliaset_idx && self.union_is_same(i, lv_aliaset_idx) {
+                    left_set.insert(i);
+                }
+                if i != rv_aliaset_idx && self.union_is_same(i, rv_aliaset_idx) {
+                    right_set.insert(i);
+                }
+            }
+        }
+
+        self.merge_alias(lv_aliaset_idx, rv_aliaset_idx);
+
+        if !in_same_set {
+            let lr_assign_or_call_id = if assign_or_call {
+                self.adg
+                    .add_assign_node(lv_aliaset_idx, rv_aliaset_idx, span)
+            } else {
+                self.adg.add_call_node(lv_aliaset_idx, rv_aliaset_idx, span)
+            };
+            let lr_rule_id = if assign_or_call {
+                self.adg.add_rule_node(
+                    &format!("Assign {:?} = {:?}", lv_aliaset_idx, rv_aliaset_idx),
+                    1.0,
+                )
+            } else {
+                self.adg.add_rule_node(
+                    &format!("Call {:?} = {:?}", lv_aliaset_idx, rv_aliaset_idx),
+                    0.9,
+                )
+            };
+            let lr_id = self.adg.add_alias_node(lv_aliaset_idx, rv_aliaset_idx);
+            self.adg.add_edge(lr_assign_or_call_id, lr_rule_id);
+            self.adg.add_edge(lr_rule_id, lr_id);
+
+            for &i in &left_set {
+                let il_id = self.adg.add_alias_node(i, lv_aliaset_idx);
+                let ir_rule_id = self.adg.add_rule_node("Alias", 1.0);
+                let ir_id = self.adg.add_alias_node(i, rv_aliaset_idx);
+                self.adg.add_edge(il_id, ir_rule_id);
+                self.adg.add_edge(lr_id, ir_rule_id);
+                self.adg.add_edge(ir_rule_id, ir_id);
+            }
+            for &j in &right_set {
+                let jr_id = self.adg.add_alias_node(j, rv_aliaset_idx);
+                let jl_rule_id = self.adg.add_rule_node("Alias", 1.0);
+                let jl_id = self.adg.add_alias_node(j, lv_aliaset_idx);
+                self.adg.add_edge(jr_id, jl_rule_id);
+                self.adg.add_edge(lr_id, jl_rule_id);
+                self.adg.add_edge(jl_rule_id, jl_id);
+            }
+            for &i in &left_set {
+                for &j in &right_set {
+                    let ir_id = self.adg.add_alias_node(i, rv_aliaset_idx);
+                    let jr_id = self.adg.add_alias_node(j, rv_aliaset_idx);
+                    let ij_rule_id = self.adg.add_rule_node("Alias", 1.0);
+                    let ij_id = self.adg.add_alias_node(i, j);
+                    self.adg.add_edge(ir_id, ij_rule_id);
+                    self.adg.add_edge(jr_id, ij_rule_id);
+                    self.adg.add_edge(ij_rule_id, ij_id);
+                }
+            }
+        }
+    }
+
     //instruction to assign alias for a variable.
     pub fn merge_alias(&mut self, lv: usize, rv: usize) {
         // if self.values[lv].alias.len() > 1 {
@@ -195,6 +436,7 @@ impl<'tcx> SafeDropGraph<'tcx> {
         if lv > self.values.len() || rv > self.values.len() {
             return;
         }
+        rap_info!("(merge_alias) Merge alias {:?} and {:?}", lv, rv);
         self.union_merge(lv, rv);
         for field in self.values[rv].fields.clone().into_iter() {
             if !self.values[lv].fields.contains_key(&field.0) {
@@ -218,7 +460,7 @@ impl<'tcx> SafeDropGraph<'tcx> {
     }
 
     //inter-procedure instruction to merge alias.
-    pub fn merge(&mut self, ret_alias: &RetAlias, arg_vec: &Vec<usize>) {
+    pub fn merge(&mut self, ret_alias: &RetAlias, arg_vec: &Vec<usize>, func_span: Span) {
         if ret_alias.left_index >= arg_vec.len() || ret_alias.right_index >= arg_vec.len() {
             rap_error!("Vector error!");
             return;
@@ -263,7 +505,7 @@ impl<'tcx> SafeDropGraph<'tcx> {
             }
             rv = *self.values[rv].fields.get(&index).unwrap();
         }
-        self.merge_alias(lv, rv);
+        self.handle_merge_alias(lv, rv, false, func_span);
     }
 
     #[inline(always)]
