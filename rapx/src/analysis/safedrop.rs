@@ -8,6 +8,7 @@ pub mod graph;
 pub mod safedrop;
 pub mod types;
 
+use std::collections::HashMap;
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty::TyCtxt;
 
@@ -67,8 +68,19 @@ pub fn query_safedrop(tcx: TyCtxt, fn_map: &FnMap, def_id: DefId, adt_owner: Adt
             safedrop_graph.adg.remove_unreachable_nodes_from_alarm();
             if safedrop_graph.adg.has_alarm() {
                 safedrop_graph.adg.calculate_alarm_confidences();
-                // println!("ADG: {:?}", safedrop_graph.adg);
-                safedrop_graph.adg.handle_user_feedback(None, None);
+                println!("ADG: {:?}", safedrop_graph.adg);
+                // safedrop_graph.adg.handle_user_feedback(None, None);
+                let mut beliefs = safedrop_graph.adg.get_confidences();
+                println!("Ranked Alarms: {:?}", safedrop_graph.adg.get_ranked_alarm_nodes(&beliefs).iter().map(|&(id, belief)| (belief, safedrop_graph.adg.get_node(id).unwrap().kind.clone())).collect::<Vec<_>>());
+                let mut evidence = HashMap::new();
+                // evidence.insert(41, false); // for case 1
+                // evidence.insert(33, false); // for case 2
+                // evidence.insert(49, false); // for case 3
+                evidence.insert(70, true);
+                evidence.insert(51, false);
+                beliefs = safedrop_graph.adg.calculate_posterior_confidences(&evidence);
+                println!("Posterior Beliefs: {:?}", beliefs);
+                println!("Ranked Alarms: {:?}", safedrop_graph.adg.get_ranked_alarm_nodes(&beliefs).iter().map(|&(id, belief)| (belief, safedrop_graph.adg.get_node(id).unwrap().kind.clone())).collect::<Vec<_>>());
             }
         } else {
             println!("Over visited: {:?}", def_id);

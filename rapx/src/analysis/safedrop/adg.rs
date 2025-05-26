@@ -1,11 +1,12 @@
 use rustc_span::Span;
 
-use std::io::{self, Write};
 use std::mem;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt,
 };
+
+use crate::rap_info;
 
 #[derive(Debug, Clone)]
 pub enum AlarmKind {
@@ -427,62 +428,19 @@ impl AlarmDerivationGraph {
         !self.alarm_set.is_empty()
     }
 
-    pub fn handle_user_feedback(
-        &mut self,
-        belief_threshold: Option<f64>,
-        max_iters: Option<usize>,
-    ) {
-        let belief_threshold = belief_threshold.unwrap_or(0.1);
-        let max_iters = max_iters.unwrap_or(100);
-
-        let mut iters = 0;
-        let mut evidence: HashMap<usize, bool> = HashMap::new();
-        let mut beliefs = self.get_confidences();
-        loop {
-            if iters >= max_iters {
-                eprintln!(
-                    "Warning: User feedback reached max iterations ({}) without converging.",
-                    max_iters
-                );
-                break;
+    pub fn compress_path(&mut self) {
+        let mut srcs = HashMap::new();
+        let mut sinks = HashMap::new();
+        let mut e = HashSet::new();
+        for node in self.nodes.values() {
+            if let NodeKind::Rule { .. } = node.kind {
+                continue;
             }
-            let ranked_alarm = self.get_ranked_alarm_nodes(&beliefs);
-            let highest_alarm_node = self.nodes.get(&ranked_alarm[0].0).unwrap();
-            println!(
-                "Highest confidence alarm: '{:?}' (ID: {})",
-                highest_alarm_node.kind, // Ensure Node has a 'name' field
-                highest_alarm_node.id,
-            );
-
-            print!("Is this a True Positive (TP) or False Positive (FP)? Enter TP/FP: ");
-            io::stdout().flush().unwrap();
-
-            let mut user_input = String::new();
-            io::stdin()
-                .read_line(&mut user_input)
-                .expect("Failed to read line");
-            let feedback = user_input.trim().to_uppercase();
-
-            let is_fp = match feedback.as_str() {
-                "FP" => true,
-                "TP" => false,
-                _ => {
-                    println!("Invalid input. Assuming FP for safety.");
-                    true
-                }
-            };
-
-            // 3. Process feedback
-            evidence.insert(highest_alarm_node.id, is_fp);
-
-            // 4. Re-calculate confidences and show updated state
-            beliefs = self.calculate_posterior_confidences(&evidence);
-
-            if beliefs.values().cloned().reduce(f64::min).unwrap() < belief_threshold {
-                break;
+            srcs.insert(node.id, node.prec_nodes.clone());
+            sinks.insert(node.id, node.succ_nodes.clone());
+            if node.prec_nodes.len() == 1 && node.succ_nodes.len() == 1 {
+                e.insert(node.id);
             }
-
-            iters += 1;
         }
     }
 
@@ -519,6 +477,16 @@ impl AlarmDerivationGraph {
                         1.0
                     }
                 }
+            }
+        }
+
+        #[inline(always)]
+        fn normalize(msg: (f64, f64)) -> (f64, f64) {
+            let sum = msg.0 + msg.1;
+            if sum == 0.0 {
+                (0.5, 0.5)
+            } else {
+                (msg.0 / sum, msg.1 / sum)
             }
         }
 
@@ -569,6 +537,7 @@ impl AlarmDerivationGraph {
                 );
                 break;
             }
+            // rap_info!("LBP Iteration: {}", iterations);
 
             let mut max_delta = 0.0;
             for node in self.nodes.values() {
@@ -608,12 +577,19 @@ impl AlarmDerivationGraph {
                     res
                 };
 
+                // rap_info!(
+                //     "Node {}: cur_lamdba_in: {:?}, cur_pi_in: {:?}",
+                //     node.id,
+                //     cur_lamdba_in,
+                //     cur_pi_in
+                // );
+
                 // 2. Calculate New Beliefs
                 if evidence.contains_key(&node.id) {
                     new_beliefs.insert(node.id, beliefs[&node.id]);
                 } else {
-                    let new_belief = (cur_lamdba_in.0 * cur_pi_in.0)
-                        / (cur_lamdba_in.0 * cur_pi_in.0 + cur_lamdba_in.1 * cur_pi_in.1);
+                    let new_belief =
+                        normalize((cur_lamdba_in.0 * cur_pi_in.0, cur_lamdba_in.1 * cur_pi_in.1)).0;
                     new_beliefs.insert(node.id, new_belief);
 
                     let delta = (new_belief - beliefs[&node.id]).abs();
@@ -659,29 +635,30 @@ impl AlarmDerivationGraph {
                             cur_lamdba_in.0 * sum_of_x_true.0 + cur_lamdba_in.1 * sum_of_x_false.0;
                         res.1 =
                             cur_lamdba_in.0 * sum_of_x_true.1 + cur_lamdba_in.1 * sum_of_x_false.1;
-                        (res.0 / (res.0 + res.1), res.1 / (res.0 + res.1))
+                        normalize(res)
                     };
 
                     new_lambda_msgs.insert((node.id, prec_id), new_lambda_out);
                 }
 
-                let tot_prod_of_lambda_msgs = node
-                    .succ_nodes
-                    .iter()
-                    .map(|&succ_id| lambda_msgs[&(succ_id, node.id)])
-                    .fold((1.0, 1.0), |acc, msg| (acc.0 * msg.0, acc.1 * msg.1));
                 for &succ_id in &node.succ_nodes {
+                    let tot_prod_of_lambda_msgs_except_self = node
+                        .succ_nodes
+                        .iter()
+                        .filter(|&&id| id != succ_id)
+                        .map(|&succ_id| lambda_msgs[&(succ_id, node.id)])
+                        .fold((1.0, 1.0), |acc, msg| (acc.0 * msg.0, acc.1 * msg.1));
                     let new_pi_out = {
                         let res = (
                             cur_pi_in.0
                                 * lambda_self[&succ_id].0
-                                * (tot_prod_of_lambda_msgs.0 / lambda_msgs[&(succ_id, node.id)].0),
+                                * tot_prod_of_lambda_msgs_except_self.0,
                             cur_pi_in.1
                                 * lambda_self[&succ_id].1
-                                * (tot_prod_of_lambda_msgs.1 / lambda_msgs[&(succ_id, node.id)].1),
+                                * tot_prod_of_lambda_msgs_except_self.1,
                         );
 
-                        (res.0 / (res.0 + res.1), res.1 / (res.0 + res.1))
+                        normalize(res)
                     };
 
                     new_pi_msgs.insert((node.id, succ_id), new_pi_out);

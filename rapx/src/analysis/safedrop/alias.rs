@@ -255,6 +255,10 @@ impl<'tcx> SafeDropGraph<'tcx> {
                     if let ty::FnDef(ref target_id, _) = constant.const_.ty().kind() {
                         if may_drop_flag > 1 {
                             if tcx.is_mir_available(*target_id) {
+                                rap_info!(
+                                    "(alias_bbcall) Found function call: {:?} with may_drop > 1",
+                                    target_id
+                                );
                                 if fn_map.contains_key(&target_id) {
                                     let assignments = fn_map.get(&target_id).unwrap();
                                     for assign in assignments.aliases().iter() {
@@ -265,8 +269,25 @@ impl<'tcx> SafeDropGraph<'tcx> {
                                     }
                                 }
                             } else {
+                                rap_info!(
+                                    "(alias_bbcall) Found function call: {:?} but MIR not available, lv.may_drop: {:?}",
+                                    target_id,
+                                    self.values[lv].may_drop
+                                );
                                 if self.values[lv].may_drop {
+                                    use crate::analysis::utils::intrinsic_id::CLONE;
+                                    if target_id.index.as_usize() == CLONE {
+                                        let mut rv_aliaset_idx = 0;
+                                        for rv in &merge_vec {
+                                            if lv != *rv {
+                                                rv_aliaset_idx = *rv;
+                                                break;
+                                            }
+                                        }
+                                        self.handle_merge_alias(lv, rv_aliaset_idx, false, call.source_info.span);
+                                    }
                                     if self.corner_handle(lv, &merge_vec, *target_id) {
+                                        rap_info!("(alias_bbcall) corner case {:?}", target_id);
                                         continue;
                                     }
                                     let mut right_set = Vec::new();
@@ -279,7 +300,8 @@ impl<'tcx> SafeDropGraph<'tcx> {
                                         }
                                     }
                                     if right_set.len() == 1 {
-                                        self.merge_alias(lv, right_set[0]);
+                                        // self.merge_alias(lv, right_set[0]);
+                                        self.handle_merge_alias(lv, right_set[0], false, call.source_info.span);
                                     }
                                 }
                             }

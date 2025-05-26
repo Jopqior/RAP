@@ -104,9 +104,17 @@ impl<'tcx> SafeDropGraph<'tcx> {
         return false;
     }
 
-    pub fn is_dangling(&mut self, local: usize) -> bool {
+    pub fn is_dangling(&mut self, local: usize) -> (bool, usize) {
         let mut record = FxHashSet::default();
-        return self.exist_dead(local, &mut record, local != 0);
+        let res = self.exist_dead(local, &mut record, local != 0);
+
+        if res {
+            if let Some(dead_node) = record.iter().find(|&&i| !self.values[i].is_alive()) {
+                return (true, *dead_node);
+            }
+            return (true, local);
+        }
+        return (false, 0);
     }
 
     pub fn df_check(&mut self, drop: usize, span: Span) -> bool {
@@ -132,18 +140,67 @@ impl<'tcx> SafeDropGraph<'tcx> {
         match current_block.is_cleanup {
             true => {
                 for i in 0..self.arg_size {
-                    if self.values[i + 1].is_ptr() && self.is_dangling(i + 1) {
+                    if self.values[i + 1].is_ptr() && self.is_dangling(i + 1).0 {
                         self.bug_records.dp_bugs_unwind.insert(self.span);
                     }
                 }
             }
             false => {
-                if self.values[0].may_drop && self.is_dangling(0) {
-                    self.bug_records.dp_bugs.insert(self.span);
+                if self.values[0].may_drop {
+                    let res = self.is_dangling(0);
+                    if res.0 {
+                        self.bug_records.dp_bugs.insert(self.span);
+
+                        let drop_id = self.adg.get_drop_node(res.1).unwrap();
+                        let rule_id = self.adg.add_rule_node("DP", 1.0);
+                        let alarm_id = self.adg.add_alarm_node(AlarmKind::DP, self.span);
+
+                        if res.1 == 0 {
+                            self.adg.add_edge(drop_id, rule_id);
+                            self.adg.add_edge(rule_id, alarm_id);
+                        } else {
+                            let alias_id = self.adg.add_alias_node(0, res.1);
+                            let drop_rule_id = self
+                                .adg
+                                .add_rule_node(&format!("DropAlias {:?} -> {:?}", res.1, 0), 1.0);
+                            let to_drop_id = self.adg.add_drop_node(0, self.span);
+                            self.adg.add_edge(drop_id, drop_rule_id);
+                            self.adg.add_edge(alias_id, drop_rule_id);
+                            self.adg.add_edge(drop_rule_id, to_drop_id);
+
+                            self.adg.add_edge(to_drop_id, rule_id);
+                            self.adg.add_edge(rule_id, alarm_id);
+                        }
+                    }
                 } else {
                     for i in 0..self.arg_size {
-                        if self.values[i + 1].is_ptr() && self.is_dangling(i + 1) {
-                            self.bug_records.dp_bugs.insert(self.span);
+                        if self.values[i + 1].is_ptr() {
+                            let res = self.is_dangling(i + 1);
+                            if res.0 {
+                                self.bug_records.dp_bugs.insert(self.span);
+
+                                let drop_id = self.adg.add_drop_node(i + 1, self.span);
+                                let rule_id = self.adg.add_rule_node("DP", 1.0);
+                                let alarm_id = self.adg.add_alarm_node(AlarmKind::DP, self.span);
+
+                                if res.1 == i + 1 {
+                                    self.adg.add_edge(drop_id, rule_id);
+                                    self.adg.add_edge(rule_id, alarm_id);
+                                } else {
+                                    let alias_id = self.adg.add_alias_node(i + 1, res.1);
+                                    let drop_rule_id = self.adg.add_rule_node(
+                                        &format!("DropAlias {:?} -> {:?}", res.1, 0),
+                                        1.0,
+                                    );
+                                    let to_drop_id = self.adg.add_drop_node(i + 1, self.span);
+                                    self.adg.add_edge(drop_id, drop_rule_id);
+                                    self.adg.add_edge(alias_id, drop_rule_id);
+                                    self.adg.add_edge(drop_rule_id, to_drop_id);
+
+                                    self.adg.add_edge(to_drop_id, rule_id);
+                                    self.adg.add_edge(rule_id, alarm_id);
+                                }
+                            }
                         }
                     }
                 }
